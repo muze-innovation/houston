@@ -44,6 +44,9 @@ type TraceExtractor func(ctx context.Context) string
 var (
 	traceExtractor TraceExtractor
 	extractorMu    sync.RWMutex
+
+	secureMode   bool
+	secureModeMu sync.RWMutex
 )
 
 // SetTraceExtractor registers the global trace extractor. Call once in main() before serving.
@@ -56,6 +59,37 @@ func SetTraceExtractor(fn TraceExtractor) {
 	extractorMu.Lock()
 	traceExtractor = fn
 	extractorMu.Unlock()
+}
+
+// EnableSecureMode activates secure error handling globally.
+// Call once at startup (before serving requests) alongside other Set* configuration.
+//
+// In secure mode:
+//   - Message() on technical errors returns a generic safe string instead of the
+//     caller-provided upstream/storage message that may contain internal details.
+//   - Details() on technical errors returns only an allowlisted subset of keys,
+//     stripping caller-provided content (upstream_message, message, url, reason, etc.).
+//   - TraceID(), Kind(), HTTPStatus(), IsBusiness(), Tags(), Unwrap(), and Error()
+//     are unaffected — Error() remains the full debug string for structured logging.
+//
+// Use DisableSecureMode() to turn it off (primarily for tests).
+func EnableSecureMode() {
+	secureModeMu.Lock()
+	secureMode = true
+	secureModeMu.Unlock()
+}
+
+// DisableSecureMode deactivates secure mode. Intended for tests only.
+func DisableSecureMode() {
+	secureModeMu.Lock()
+	secureMode = false
+	secureModeMu.Unlock()
+}
+
+func isSecureMode() bool {
+	secureModeMu.RLock()
+	defer secureModeMu.RUnlock()
+	return secureMode
 }
 
 // ExtractTrace runs the registered extractor against ctx.
@@ -133,16 +167,27 @@ type kvPair struct {
 	value string
 }
 
+// secureModeDetailAllowlist is the set of detail keys retained when secure mode is active
+// for technical (non-business) errors. Keys not in this list may contain caller-provided
+// content from upstream services or storage layers and are stripped to prevent leakage.
+var secureModeDetailAllowlist = map[string]bool{
+	"service_name":    true,
+	"operation":       true,
+	"data_source":     true,
+	"upstream_status": true,
+}
+
 type appErr struct {
-	kind       string
-	message    string
-	httpStatus int
-	isBiz      bool
-	traceID    string
-	tags       []Tag
-	contexts   []string
-	details    []kvPair
-	cause      error
+	kind        string
+	message     string
+	safeMessage string // returned by Message() in secure mode for tech errors
+	httpStatus  int
+	isBiz       bool
+	traceID     string
+	tags        []Tag
+	contexts    []string
+	details     []kvPair
+	cause       error
 }
 
 func newErr(ctx context.Context, kind, message string, httpStatus int, isBiz bool, cause error) *appErr {
@@ -161,7 +206,17 @@ func (e *appErr) addDetail(key, value string) *appErr {
 	return e
 }
 
-func (e *appErr) Message() string    { return e.message }
+func (e *appErr) withSafeMessage(msg string) *appErr {
+	e.safeMessage = msg
+	return e
+}
+
+func (e *appErr) Message() string {
+	if isSecureMode() && !e.isBiz && e.safeMessage != "" {
+		return e.safeMessage
+	}
+	return e.message
+}
 func (e *appErr) HTTPStatus() int    { return e.httpStatus }
 func (e *appErr) IsBusiness() bool   { return e.isBiz }
 func (e *appErr) Kind() string       { return e.kind }
@@ -170,6 +225,15 @@ func (e *appErr) Tags() []Tag        { return e.tags }
 func (e *appErr) Unwrap() error      { return e.cause }
 
 func (e *appErr) Details() map[string]string {
+	if isSecureMode() && !e.isBiz {
+		m := make(map[string]string)
+		for _, kv := range e.details {
+			if secureModeDetailAllowlist[kv.key] {
+				m[kv.key] = kv.value
+			}
+		}
+		return m
+	}
 	m := make(map[string]string, len(e.details))
 	for _, kv := range e.details {
 		m[kv.key] = kv.value
@@ -218,14 +282,15 @@ func (e *appErr) clone() *appErr {
 	details := make([]kvPair, len(e.details))
 	copy(details, e.details)
 	return &appErr{
-		kind:       e.kind,
-		message:    e.message,
-		httpStatus: e.httpStatus,
-		isBiz:      e.isBiz,
-		traceID:    e.traceID,
-		tags:       tags,
-		contexts:   ctxs,
-		details:    details,
-		cause:      e.cause,
+		kind:        e.kind,
+		message:     e.message,
+		safeMessage: e.safeMessage,
+		httpStatus:  e.httpStatus,
+		isBiz:       e.isBiz,
+		traceID:     e.traceID,
+		tags:        tags,
+		contexts:    ctxs,
+		details:     details,
+		cause:       e.cause,
 	}
 }

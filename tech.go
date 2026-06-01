@@ -19,6 +19,7 @@ func UnexpectedResponse(ctx context.Context, serviceName string, upstreamStatus 
 		upstreamStatus,
 		false, nil,
 	).
+		withSafeMessage("an upstream service returned an unexpected response").
 		addDetail("service_name", serviceName).
 		addDetail("upstream_status", strconv.Itoa(upstreamStatus)).
 		addDetail("upstream_message", upstreamMessage)
@@ -41,6 +42,7 @@ func NetworkError(ctx context.Context, serviceName, method, url, operation strin
 		http.StatusBadGateway,
 		false, cause,
 	).
+		withSafeMessage("a network error occurred calling an upstream service").
 		addDetail("service_name", serviceName).
 		addDetail("method", method).
 		addDetail("url", url).
@@ -60,6 +62,7 @@ func StorageError(ctx context.Context, datasource, operation, message string, ca
 		http.StatusInternalServerError,
 		false, cause,
 	).
+		withSafeMessage("a storage error occurred").
 		addDetail("data_source", datasource).
 		addDetail("operation", operation).
 		addDetail("message", message)
@@ -77,6 +80,7 @@ func CircuitOpen(ctx context.Context, serviceName string) Problem {
 		http.StatusServiceUnavailable,
 		false, nil,
 	).
+		withSafeMessage("the service is currently unavailable").
 		addDetail("service_name", serviceName)
 }
 
@@ -92,6 +96,7 @@ func Timeout(ctx context.Context, serviceName, operation string) Problem {
 		http.StatusGatewayTimeout,
 		false, nil,
 	).
+		withSafeMessage("the request timed out").
 		addDetail("service_name", serviceName).
 		addDetail("operation", operation)
 }
@@ -108,6 +113,7 @@ func ConfigMissing(ctx context.Context, key string) Problem {
 		http.StatusInternalServerError,
 		false, nil,
 	).
+		withSafeMessage("a configuration error occurred").
 		addDetail("configuration_key", key)
 }
 
@@ -124,5 +130,6 @@ func Internal(ctx context.Context, reason string) Problem {
 		http.StatusInternalServerError,
 		false, nil,
 	).
+		withSafeMessage("an internal error occurred").
 		addDetail("reason", reason)
 }

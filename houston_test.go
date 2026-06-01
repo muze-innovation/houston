@@ -530,6 +530,184 @@ func TestResolveCode_WithMapper(t *testing.T) {
 	}
 }
 
+// --- secure mode ---
+
+func setupSecureMode(t *testing.T) {
+	t.Helper()
+	houston.EnableSecureMode()
+	t.Cleanup(houston.DisableSecureMode)
+}
+
+func TestSecureMode_TechMessageIsGeneric(t *testing.T) {
+	setupSecureMode(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		p    houston.Problem
+		want string
+	}{
+		{"UnexpectedResponse", houston.UnexpectedResponse(ctx, "identity-svc", 503, "pq: connection string exposed"), "an upstream service returned an unexpected response"},
+		{"NetworkError", houston.NetworkError(ctx, "identity-svc", "POST", "/v1/token?secret=abc", "ExchangeToken", nil), "a network error occurred calling an upstream service"},
+		{"StorageError", houston.StorageError(ctx, "postgres", "insert", "duplicate key on users.email", nil), "a storage error occurred"},
+		{"CircuitOpen", houston.CircuitOpen(ctx, "profile-svc"), "the service is currently unavailable"},
+		{"Timeout", houston.Timeout(ctx, "cms-svc", "GetProducts"), "the request timed out"},
+		{"ConfigMissing", houston.ConfigMissing(ctx, "DB_PASSWORD"), "a configuration error occurred"},
+		{"Internal", houston.Internal(ctx, "mapper returned nil for known key"), "an internal error occurred"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.p.Message() != tc.want {
+				t.Errorf("Message() = %q, want %q", tc.p.Message(), tc.want)
+			}
+		})
+	}
+}
+
+func TestSecureMode_BizMessageUnchanged(t *testing.T) {
+	setupSecureMode(t)
+	ctx := context.Background()
+
+	p := houston.ResourceNotFound(ctx, "user", "uid-123")
+	want := "user not found: uid-123"
+	if p.Message() != want {
+		t.Errorf("Message() = %q, want %q", p.Message(), want)
+	}
+}
+
+func TestSecureMode_TechDetailsAllowlisted(t *testing.T) {
+	setupSecureMode(t)
+	ctx := context.Background()
+
+	p := houston.StorageError(ctx, "postgres", "insert", "pq: duplicate key violates constraint users_email_idx", nil)
+	d := p.Details()
+
+	if d["data_source"] != "postgres" {
+		t.Errorf("data_source = %q, want %q", d["data_source"], "postgres")
+	}
+	if d["operation"] != "insert" {
+		t.Errorf("operation = %q, want %q", d["operation"], "insert")
+	}
+	if _, ok := d["message"]; ok {
+		t.Error("message key must be stripped in secure mode")
+	}
+}
+
+func TestSecureMode_NetworkErrorDetailsAllowlisted(t *testing.T) {
+	setupSecureMode(t)
+	ctx := context.Background()
+
+	p := houston.NetworkError(ctx, "identity-svc", "POST", "/v1/token?api_key=secret", "ExchangeToken", nil)
+	d := p.Details()
+
+	if d["service_name"] != "identity-svc" {
+		t.Errorf("service_name = %q, want %q", d["service_name"], "identity-svc")
+	}
+	if d["operation"] != "ExchangeToken" {
+		t.Errorf("operation = %q, want %q", d["operation"], "ExchangeToken")
+	}
+	if _, ok := d["url"]; ok {
+		t.Error("url key must be stripped in secure mode (may contain tokens)")
+	}
+	if _, ok := d["method"]; ok {
+		t.Error("method key must be stripped in secure mode")
+	}
+}
+
+func TestSecureMode_UnexpectedResponseDetailsAllowlisted(t *testing.T) {
+	setupSecureMode(t)
+	ctx := context.Background()
+
+	p := houston.UnexpectedResponse(ctx, "identity-svc", 503, "internal db error: postgres://admin:pass@host/db")
+	d := p.Details()
+
+	if d["service_name"] != "identity-svc" {
+		t.Errorf("service_name = %q, want %q", d["service_name"], "identity-svc")
+	}
+	if d["upstream_status"] != "503" {
+		t.Errorf("upstream_status = %q, want %q", d["upstream_status"], "503")
+	}
+	if _, ok := d["upstream_message"]; ok {
+		t.Error("upstream_message must be stripped in secure mode")
+	}
+}
+
+func TestSecureMode_BizDetailsUnchanged(t *testing.T) {
+	setupSecureMode(t)
+	ctx := context.Background()
+
+	p := houston.ResourceNotFound(ctx, "order", "ord-999")
+	d := p.Details()
+	if d["resource_type"] != "order" {
+		t.Errorf("resource_type = %q, want %q", d["resource_type"], "order")
+	}
+	if d["resource_identifier"] != "ord-999" {
+		t.Errorf("resource_identifier = %q, want %q", d["resource_identifier"], "ord-999")
+	}
+}
+
+func TestSecureMode_TraceIDStillAccessible(t *testing.T) {
+	setupSecureMode(t)
+	setupTraceExtractor(t)
+
+	ctx := ctxWithTrace("trace-secure-123")
+	p := houston.Internal(ctx, "reason")
+
+	if p.TraceID() != "trace-secure-123" {
+		t.Errorf("TraceID() = %q, want %q", p.TraceID(), "trace-secure-123")
+	}
+}
+
+func TestSecureMode_ErrorStringUnchanged(t *testing.T) {
+	setupSecureMode(t)
+	ctx := context.Background()
+
+	cause := errors.New("disk full")
+	p := houston.StorageError(ctx, "pg", "insert", "write failed", cause)
+
+	s := p.Error()
+	if !contains(s, "storage_error") {
+		t.Errorf("Error() missing kind: %q", s)
+	}
+	if !contains(s, "disk full") {
+		t.Errorf("Error() missing cause — must remain full for logs: %q", s)
+	}
+}
+
+func TestSecureMode_UnwrapIntact(t *testing.T) {
+	setupSecureMode(t)
+	ctx := context.Background()
+
+	sentinel := errors.New("root cause")
+	p := houston.StorageError(ctx, "pg", "select", "query failed", sentinel)
+	if !errors.Is(p, sentinel) {
+		t.Error("errors.Is must find sentinel through Unwrap chain in secure mode")
+	}
+}
+
+func TestSecureMode_TagRetainedAfterClone(t *testing.T) {
+	setupSecureMode(t)
+	ctx := context.Background()
+
+	p := houston.Internal(ctx, "reason").Tag(houston.AlertOncall{})
+	if p.Message() != "an internal error occurred" {
+		t.Errorf("Message() after Tag() = %q", p.Message())
+	}
+	if _, ok := findTag[houston.AlertOncall](p); !ok {
+		t.Error("AlertOncall tag lost after clone in secure mode")
+	}
+}
+
+func TestSecureMode_OffByDefault(t *testing.T) {
+	// no setupSecureMode — verify default behavior unaffected
+	p := houston.Internal(context.Background(), "mapper returned nil")
+	want := "internal error: mapper returned nil"
+	if p.Message() != want {
+		t.Errorf("Message() without secure mode = %q, want %q", p.Message(), want)
+	}
+}
+
 // --- helpers ---
 
 func contains(s, sub string) bool {
