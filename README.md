@@ -1,6 +1,6 @@
 # Houston
 
-> "Houston, we have a problem."
+> ["Houston, we have a problem."](https://en.wikipedia.org/wiki/Houston,_we_have_a_problem)
 
 Application-aware error system for Go. The ergonomic way to declare that something went wrong.
 
